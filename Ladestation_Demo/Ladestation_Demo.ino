@@ -6,6 +6,7 @@
 
 #include "ChargeScreen.h"
 #include "CarInfoNFC.h"
+#include "IRSender.h"
 
 // TFT Screen
 #include <SPI.h>
@@ -25,9 +26,17 @@ ChargeScreen* chargeScreen;
 #include <PN532.h>
 #include <NfcAdapter.h>
 
+typedef enum EState
+{
+	eSTATE_STANDBY = 0,
+	eSTATE_PREPARE = 1,
+	eSTATE_CHARGE = 2,
+	eSTATE_FINISHED = 3,
+};
+
 CarInfoNFC* carInfo;
 
-uint8_t state = 0;
+EState state = eSTATE_STANDBY;
 
 
 // Resistor Charge current
@@ -41,43 +50,65 @@ uint8_t state = 0;
 Charger* charger;
 
 // Servo
-#include "Servo.h"
-#define SERVO_IDLE_POS 90
-#define SERVO_MAX_POS 110
+#define SERVO_DOWN 0
+#define SERVO_UP 1
+#define SERVO_PIN 6
 
-Servo servo;
+// IR Sender
+IRSender* irSender;
+#define IR_OUT_PIN A3
+
+// IR Stop
+#define IR_STOP_PIN 4
 
 uint32_t _startTime = 0;
 
+// Variables
+bool carPresent = false;
+carInformation_t carData;
+
 // the setup function runs once when you press reset or power the board
-void setup() 
+void setup()
 {
 	pinMode(CHRG0_PIN, INPUT_PULLUP);
 	pinMode(CHRG1_PIN, INPUT_PULLUP);
+	pinMode(SERVO_PIN, OUTPUT);
+	digitalWrite(SERVO_PIN, SERVO_DOWN);
+
+	pinMode(IR_STOP_PIN, OUTPUT);
 
 	carInfo = new CarInfoNFC();
 	chargeScreen = new ChargeScreen(TFT_CS_PIN, TFT_DC_PIN, TFT_RST_PIN);
-	
+
 	chargeScreen->printNoCar();
 
 	charger = new Charger(X9C503_RESISTANCE, CR_CS_PIN, CR_UD_PIN, CR_INC_PIN);
 
-	state = 0;
+	irSender = new IRSender(IR_OUT_PIN);
 
-	servo.attach(6);
-	servo.write(SERVO_IDLE_POS);
+	state = eSTATE_STANDBY;
 }
 
-// the loop function runs over and over again until power down or reset
-
 // @attention if the car is lift up, it looses the NFC Tag!!
-void loop() 
+void loop()
 {
-	if (carInfo->getCarPresent())
+	// check for car
+  if(state != eSTATE_CHARGE)
+  {
+    carPresent = carInfo->getCarPresent();
+  }
+
+	switch (state)
 	{
-		if (state == 0)
+	case eSTATE_STANDBY:
+	{
+		servoIdle();
+
+		activateIrStop(true);
+
+		if (carPresent)
 		{
-			carInformation_t carData = {};
+			// Read Car Info
 			if (carInfo->getCarInfo(&carData))
 			{
 				chargeScreen->printCarInfo(carData.address, carData.capacity, carData.chargingRate, (char*)carData.carType);
@@ -85,8 +116,7 @@ void loop()
 				{
 					chargeScreen->printChargeResistor(charger->GetEstimatedResistance());
 
-					servoUp();
-					state = 1;
+					state = eSTATE_PREPARE;
 				}
 				else
 				{
@@ -96,60 +126,129 @@ void loop()
 			else
 			{
 				chargeScreen->printError("Empty values");
-				state = 0;
 			}
 		}
-		if (state == 1)
-		{
-			if (digitalRead(CHRG0_PIN) == 1 && digitalRead(CHRG1_PIN) == 0)
-			{
-				state = 2;
-				_startTime = millis();
-				chargeScreen->printCharging(millis() - _startTime);
-			}
-		}
-		if (state == 2)
-		{
-			chargeScreen->printChargingUpdateTime(millis()-_startTime);
-
-			if (digitalRead(CHRG0_PIN) == 0 && digitalRead(CHRG1_PIN) == 1)
-			{
-				state = 3;
-				chargeScreen->printFinishCharging(millis() - _startTime);
-				servoIdle();
-			}
-		}
+		break;
 	}
-	else
+
+	case eSTATE_PREPARE:
 	{
-		if (state != 0)
-		{ 
-			state = 0;
+		if (carPresent)
+		{
+			// Send DCC Command Speed 0
+			irSender->Speed(carData.address, 0);
+			delay(100);
+
+			// Deactivate IR Stop (cars speed is now 0)
+			activateIrStop(false);
+			delay(100);
+
+			// Switch off car
+			irSender->Function(carData.address, 8, true);
+			delay(100);
+			irSender->Function(carData.address, 8, false);
+			delay(100);
+
+			servoUp();
+      delay(1000);
+
+			//if (digitalRead(CHRG0_PIN) == 1 && digitalRead(CHRG1_PIN) == 0)
+			//{
+			state = eSTATE_CHARGE;
+			_startTime = millis();
+			chargeScreen->printCharging(millis() - _startTime);
+			//}
+			//else
+			//{
+				// TODO
+			//}
+		}
+		else
+		{ // Car is no longer present
+			state = eSTATE_STANDBY;
 			chargeScreen->printNoCar();
+		}
+		break;
+	}
+
+	case eSTATE_CHARGE:
+	{
+		chargeScreen->printChargingUpdateTime(millis() - _startTime);
+
+		if ((digitalRead(CHRG0_PIN) == 0 && digitalRead(CHRG1_PIN) == 1) || (millis()>20000))
+		{
+			state = eSTATE_FINISHED;
+			chargeScreen->printFinishCharging(3246734);
+			servoIdle();
+      delay(3000);
+		}
+		else if (digitalRead(CHRG0_PIN) == 1 && digitalRead(CHRG1_PIN) == 1)
+		{
+			// Error while charging
+			//state = eSTATE_FINISHED;
+			//chargeScreen->printFinishCharging(millis() - _startTime);
 			//servoIdle();
 		}
+		else
+		{
+			// Still charging
+		}
+		break;
+	}
+
+	case eSTATE_FINISHED:
+	{
+		if (carPresent)
+		{
+			// This now enables the CAR
+			activateIrStop(true);
+			delay(1000);
+
+			// Drive away
+			irSender->Speed(carData.address, 10);
+			activateIrStop(false);
+			delay(1000);
+			state = eSTATE_STANDBY;
+			chargeScreen->printNoCar();
+		}
+		else
+		{
+			state = eSTATE_STANDBY;
+			chargeScreen->printNoCar();
+		}
+		break;
+	}
+
+	default:
+		state = eSTATE_STANDBY;
+		chargeScreen->printNoCar();
+		break;
 	}
 
 	chargeScreen->printLED(0, digitalRead(CHRG0_PIN));
 	chargeScreen->printLED(1, digitalRead(CHRG1_PIN));
-	
+
 	delay(1);
 }
 
 void servoUp()
 {
-	for (int i = SERVO_IDLE_POS; i < SERVO_MAX_POS; i++)
-	{
-		servo.write(i);
-		delay(50);
-	}
+	digitalWrite(SERVO_PIN, SERVO_UP);
 }
 
 void servoIdle()
 {
-	for (int i = SERVO_MAX_POS; i > SERVO_IDLE_POS; i--)
+	digitalWrite(SERVO_PIN, SERVO_DOWN);
+}
+
+void activateIrStop(bool activate)
+{
+	if (activate)
 	{
-		servo.write(i);
-		delay(50);
+		digitalWrite(IR_STOP_PIN, 0);
+	}
+	else
+	{
+		digitalWrite(IR_STOP_PIN, 1);
 	}
 }
